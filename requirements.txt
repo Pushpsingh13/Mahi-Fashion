@@ -1,0 +1,14 @@
+streamlit
+pandas
+gdown
+openpyxl
+reportlab
+pywhatkit
+pip
+gspread
+google-auth-oauthlib
+requests
+pytz
+PyMuPDF
+streamlit-modal
+streamlit-option-menu

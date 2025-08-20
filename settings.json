@@ -1,0 +1,9 @@
+{
+  "owner_phone": "+919259317713",
+  "smtp_server": "smtp.gmail.com",
+  "smtp_port": 587,
+  "sender_email": "Pushp.singh13@gmail.com",
+  "sender_password": "khzx jwld axxv dkey",
+  "tax_rate": 5.0,
+  "default_discount": 0.0
+}
