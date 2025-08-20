@@ -12,12 +12,14 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 import urllib.parse
+import glob
 
 # -------------------------
 # Configuration / files
 # -------------------------
 MENU_EXCEL = "Product_Details_Cleaned.xlsx"
 SALES_CSV = "sales_records.csv"
+ORDER_CSV = "orderdetails.csv"
 SETTINGS_JSON = "settings.json"
 INVOICES_DIR = "invoices"
 ADMIN_PASSWORD = "admin123"
@@ -27,8 +29,10 @@ os.makedirs(INVOICES_DIR, exist_ok=True)
 # -------------------------
 # Helpers
 # -------------------------
+
 def tz_now() -> datetime:
     return datetime.now(pytz.timezone("Asia/Kolkata"))
+
 
 def create_sample_menu() -> pd.DataFrame:
     return pd.DataFrame({
@@ -38,26 +42,32 @@ def create_sample_menu() -> pd.DataFrame:
         "Images": ["", "", ""]
     })
 
+
 def ensure_menu_exists():
     if not os.path.exists(MENU_EXCEL):
         create_sample_menu().to_excel(MENU_EXCEL, index=False, engine="openpyxl")
 
+
 def find_image_columns(df: pd.DataFrame) -> List[str]:
     return [c for c in df.columns if c.lower().startswith("image")]
 
-# 🔹 Updated load_menu
 
 def load_menu() -> pd.DataFrame:
     ensure_menu_exists()
-    df = pd.read_excel(MENU_EXCEL, engine="openpyxl")
+    try:
+        df = pd.read_excel(MENU_EXCEL, engine="openpyxl")
+    except Exception:
+        # fallback to sample
+        df = create_sample_menu()
+        df.to_excel(MENU_EXCEL, index=False, engine="openpyxl")
 
-    # Drop junk unnamed columns
+    # Drop unnamed columns
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
 
     required_cols = ["Item", "Size", "Price"]
     for c in required_cols:
         if c not in df.columns:
-            raise ValueError(f"Excel must include columns: {required_cols}")
+            df[c] = "" if c in ("Item", "Size") else 0.0
 
     df["Item"] = df["Item"].fillna("").astype(str)
     df["Size"] = df["Size"].fillna("").astype(str)
@@ -70,11 +80,19 @@ def load_menu() -> pd.DataFrame:
             axis=1
         )
     else:
-        df["All_Images"] = [[] for _ in range(len(df))]
+        # If individual Images columns exist use them
+        possible_cols = [c for c in df.columns if c.lower().startswith("images")]
+        if possible_cols:
+            df["All_Images"] = df[possible_cols].apply(
+                lambda row: [s for s in [str(x).strip() for x in row.tolist()] if s and s.lower() != "nan"],
+                axis=1
+            )
+        else:
+            df["All_Images"] = [[] for _ in range(len(df))]
 
     return df
 
-# 🔹 Updated write_menu
+
 def write_menu(df: pd.DataFrame):
     if "Item" not in df.columns:
         df["Item"] = ""
@@ -101,6 +119,7 @@ def write_menu(df: pd.DataFrame):
 
     df_to_save.to_excel(MENU_EXCEL, index=False, engine="openpyxl")
 
+
 def parse_sizes(s_raw: str) -> List[str]:
     s = (s_raw or "").strip()
     if not s:
@@ -115,6 +134,7 @@ def parse_sizes(s_raw: str) -> List[str]:
 # -------------------------
 # Settings persistence
 # -------------------------
+
 def load_settings() -> dict:
     defaults = {
         "owner_phone": "919999999999",
@@ -134,6 +154,7 @@ def load_settings() -> dict:
             pass
     return defaults
 
+
 def save_settings(settings: dict):
     with open(SETTINGS_JSON, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -141,10 +162,9 @@ def save_settings(settings: dict):
 settings = load_settings()
 
 # -------------------------
-# Sales & Invoices (unchanged)
+# Sales & Invoices
 # -------------------------
-# [KEEP the rest of your original code for save_sale, build_invoice_excel, build_receipt_pdf, send_email_receipt, wa_me_url]
-# Sales & Invoices (kept similar to your original)
+
 def save_sale(order_id: str, item_rows: list, totals: dict, customer: dict):
     rows = []
     now = tz_now()
@@ -158,18 +178,49 @@ def save_sale(order_id: str, item_rows: list, totals: dict, customer: dict):
             "Price": r["price"],
             "Customer": customer.get("name", ""),
             "Phone": customer.get("phone", ""),
+            "Email": customer.get("email", ""),
+            "Address": customer.get("addr", ""),
             "Subtotal": totals["subtotal"],
             "Tax": totals["tax"],
             "Discount": totals["discount"],
             "GrandTotal": totals["grand"]
         })
     df_new = pd.DataFrame(rows)
+
+    # save/append to sales_records.csv
     if os.path.exists(SALES_CSV):
-        df_old = pd.read_csv(SALES_CSV)
-        df_final = pd.concat([df_old, df_new], ignore_index=True)
+        try:
+            df_old = pd.read_csv(SALES_CSV)
+            df_final = pd.concat([df_old, df_new], ignore_index=True)
+        except Exception:
+            df_final = df_new
     else:
         df_final = df_new
     df_final.to_csv(SALES_CSV, index=False)
+
+    # save/append to orderdetails.csv (all-time)
+    if os.path.exists(ORDER_CSV):
+        try:
+            df_old = pd.read_csv(ORDER_CSV)
+            df_final_all = pd.concat([df_old, df_new], ignore_index=True)
+        except Exception:
+            df_final_all = df_new
+    else:
+        df_final_all = df_new
+    df_final_all.to_csv(ORDER_CSV, index=False)
+
+    # save/append to date-wise CSV
+    datewise_csv = f"orderdetails_{now.strftime('%Y-%m-%d')}.csv"
+    if os.path.exists(datewise_csv):
+        try:
+            df_old = pd.read_csv(datewise_csv)
+            df_final_date = pd.concat([df_old, df_new], ignore_index=True)
+        except Exception:
+            df_final_date = df_new
+    else:
+        df_final_date = df_new
+    df_final_date.to_csv(datewise_csv, index=False)
+
 
 def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: dict) -> Tuple[bytes, str]:
     invoice_df = pd.DataFrame(item_rows)
@@ -177,10 +228,10 @@ def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: 
         "OrderID": order_id,
         "Date": tz_now().strftime("%Y-%m-%d"),
         "Time": tz_now().strftime("%H:%M:%S"),
-        "Customer": customer.get("name",""),
-        "Phone": customer.get("phone",""),
-        "Email": customer.get("email",""),
-        "Address": customer.get("addr",""),
+        "Customer": customer.get("name", ""),
+        "Phone": customer.get("phone", ""),
+        "Email": customer.get("email", ""),
+        "Address": customer.get("addr", ""),
         "Subtotal": totals["subtotal"],
         "Tax": totals["tax"],
         "Discount": totals["discount"],
@@ -197,12 +248,12 @@ def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: 
         f.write(out.getvalue())
     return out.getvalue(), path
 
+
 def build_receipt_pdf(order_id: str, bill_rows: list, totals: dict, cust: dict) -> Optional[io.BytesIO]:
     try:
         from reportlab.pdfgen import canvas
         from reportlab.lib.units import mm
     except ImportError:
-        # If reportlab not installed, return None (UI will still work)
         return None
     lines = max(1, len(bill_rows))
     width = 80 * mm
@@ -265,6 +316,7 @@ def build_receipt_pdf(order_id: str, bill_rows: list, totals: dict, cust: dict) 
     buf.seek(0)
     return buf
 
+
 def send_email_receipt(to_email: Optional[str], subject: str, body_text: str, pdf_bytes: bytes, order_id: str,
                        smtp_server: str, smtp_port: int, sender_email: str, sender_password: str) -> bool:
     if not to_email:
@@ -292,20 +344,17 @@ def send_email_receipt(to_email: Optional[str], subject: str, body_text: str, pd
         st.error(f"Failed to send email: {e}")
         return False
 
+
 def wa_me_url(phone_digits: Optional[str], message: str) -> str:
     if not phone_digits:
         return ""
     digits = "".join(ch for ch in phone_digits if ch.isdigit())
     return f"https://wa.me/{digits}?text={urllib.parse.quote(message)}"
 
-
-# -------------------------
-# Streamlit UI (unchanged except it uses new load_menu/write_menu)
-# -------------------------
-# [KEEP the rest of your original app.py code as you had it, no changes needed]
 # -------------------------
 # Streamlit UI
 # -------------------------
+
 st.set_page_config(page_title="Mahi Fashion Store", layout="wide")
 st.title("🛍️ Mahi Fashion Store")
 
@@ -344,7 +393,10 @@ with tab_shop:
                 st.subheader(p["Item"])
                 imgs = p.get("All_Images") or []
                 if imgs:
-                    st.image(imgs[0], use_container_width=True)
+                    try:
+                        st.image(imgs[0], use_container_width=True)
+                    except Exception:
+                        pass
                 st.write(f"Price: ₹{float(p['Price']):.2f}")
                 sizes = parse_sizes(p.get("Size", ""))
                 if sizes:
@@ -390,11 +442,13 @@ with tab_cart:
         for i, item in enumerate(st.session_state.cart):
             col1, col2, col3, col4 = st.columns([1, 3, 1, 1])
             with col1:
-                # Find the product image
-                product_info = menu_df[menu_df['Item'] == item['item']].iloc[0]
-                images = product_info.get('All_Images', [])
-                if images:
-                    st.image(images[0], width=50)
+                try:
+                    product_info = menu_df[menu_df['Item'] == item['item']].iloc[0]
+                    images = product_info.get('All_Images', [])
+                    if images:
+                        st.image(images[0], width=50)
+                except Exception:
+                    pass
             with col2:
                 st.write(f"{item['item']} ({item['size']})")
             with col3:
@@ -403,7 +457,7 @@ with tab_cart:
                 if st.button(f"Delete", key=f"delete_{i}"):
                     st.session_state.cart.pop(i)
                     st.rerun()
-        
+
         subtotal = sum(item['price'] for item in st.session_state.cart)
         tax = subtotal * (settings.get("tax_rate", 5.0)/100)
         discount = subtotal * (settings.get("default_discount", 0.0)/100)
@@ -418,14 +472,16 @@ with tab_cart:
             cname = st.text_input("Name")
             cphone = st.text_input("Phone")
             cemail = st.text_input("Email")
-            caddr = st.text_area("Address")
+            caddr = st.text_input("Address")   # require single-line text input like other boxes
+
             submitted = st.form_submit_button("Checkout")
             if submitted:
-                if not cname or not cphone:
-                    st.error("Name and Phone are required.")
+                # require all fields
+                if not cname.strip() or not cphone.strip() or not cemail.strip() or not caddr.strip():
+                    st.error("Please fill all fields (Name, Phone, Email, Address).")
                 else:
                     order_id = f"ORD{tz_now().strftime('%Y%m%d%H%M%S')}"
-                    cust = {"name": cname, "phone": cphone, "email": cemail, "addr": caddr}
+                    cust = {"name": cname.strip(), "phone": cphone.strip(), "email": cemail.strip(), "addr": caddr.strip()}
                     totals = {"subtotal": subtotal, "tax": tax, "discount": discount, "grand": grand}
                     save_sale(order_id, st.session_state.cart, totals, cust)
                     inv_bytes, _ = build_invoice_excel(order_id, st.session_state.cart, totals, cust)
@@ -442,7 +498,7 @@ with tab_admin:
     if pw == ADMIN_PASSWORD:
         st.success("Logged in")
 
-        # 🔹 Settings section
+        # Settings
         settings["owner_phone"] = st.text_input("Owner WhatsApp Number", settings.get("owner_phone", ""))
         settings["smtp_server"] = st.text_input("SMTP Server", settings.get("smtp_server", "smtp.gmail.com"))
         settings["smtp_port"] = st.number_input("SMTP Port", value=int(settings.get("smtp_port", 587)))
@@ -461,12 +517,12 @@ with tab_admin:
         st.dataframe(menu_df)
 
         # Upload new file
-        new_file = st.file_uploader("Upload updated product Excel", type=["xlsx"])
+        new_file = st.file_uploader("Upload updated product Excel", type=["xlsx"] )
         if new_file:
             with open(MENU_EXCEL, "wb") as f:
                 f.write(new_file.getbuffer())
             st.success("Product list updated!")
-            st.rerun()  # ✅ fixed: use st.rerun, not experimental_rerun
+            st.rerun()
 
         # Add new product
         with st.expander("➕ Add Product"):
@@ -494,17 +550,33 @@ with tab_admin:
                     st.rerun()
                 else:
                     st.error("Item Name cannot be empty")
+
+        st.markdown("---")
+        st.subheader("📦 Order Details CSVs")
+
+        # Download all-time orders
+        if os.path.exists(ORDER_CSV):
+            with open(ORDER_CSV, "rb") as f:
+                st.download_button("Download All Orders (orderdetails.csv)", f, file_name=ORDER_CSV)
+
+        # Download date-wise files
+        datewise_files = sorted(glob.glob("orderdetails_*.csv"))
+        if datewise_files:
+            for fpath in datewise_files:
+                fname = os.path.basename(fpath)
+                with open(fpath, "rb") as f:
+                    st.download_button(f"Download {fname}", f, file_name=fname)
+
     else:
         if pw:
             st.error("Invalid password")
 
-        # Show small summary / download button
+        # Show small summary / download button for non-admin
         st.write(f"Products in file: **{len(menu_df)}**")
         col1, col2 = st.columns([1, 3])
         with col1:
             uploaded = st.file_uploader("Upload Excel to replace product list", type=["xlsx"])
             if uploaded:
-                # Replace file entirely
                 with open(MENU_EXCEL, "wb") as f:
                     f.write(uploaded.getbuffer())
                 st.success("Product Excel replaced. Reloading...")
@@ -521,22 +593,18 @@ with tab_admin:
                     st.rerun()
 
         st.markdown("**Current product table**")
-        # Show the table (small)
         st.dataframe(menu_df.reset_index().rename(columns={"index":"RowIndex"}), height=250)
 
         st.markdown("### Edit / Delete product")
-        # select a product to edit by index row
         if len(menu_df) > 0:
             options = list(menu_df.index.astype(str))
             sel_idx = st.selectbox("Select product row index", options)
             sel_idx_int = int(sel_idx)
             prod = menu_df.loc[sel_idx_int].to_dict()
-            # prefill edit form
             with st.form("edit_product_form"):
-                new_item = st.text_input("Item", value=prod.get("Item",""))
-                new_size = st.text_input("Size", value=prod.get("Size",""))
+                new_item = st.text_input("Item", value=prod.get("Item", ""))
+                new_size = st.text_input("Size", value=prod.get("Size", ""))
                 new_price = st.number_input("Price", value=float(prod.get("Price", 0.0)))
-                # handle images: show All_Images concatenated and editable
                 imgs = prod.get("All_Images") or []
                 img_text = ",".join(imgs)
                 new_imgs_text = st.text_input("Images (comma separated URLs/paths)", value=img_text)
@@ -546,25 +614,11 @@ with tab_admin:
                 with col_delete:
                     delete_btn = st.form_submit_button("Delete Product")
                 if update_btn:
-                    # apply changes
                     menu_df.at[sel_idx_int, "Item"] = new_item
                     menu_df.at[sel_idx_int, "Size"] = new_size
                     menu_df.at[sel_idx_int, "Price"] = new_price
                     new_imgs = [i.strip() for i in new_imgs_text.split(",") if i.strip()]
                     menu_df.at[sel_idx_int, "All_Images"] = new_imgs
-                    # write back to excel
-                    write_menu(menu_df)
-                    # ensure reindex and save
-                    # rebuild All_Images if missing
-                    if "All_Images" not in menu_df.columns:
-                        image_cols = find_image_columns(menu_df)
-                        if image_cols:
-                            menu_df["All_Images"] = menu_df[image_cols].apply(
-                                lambda row: [s for s in [str(x).strip() for x in row.tolist()] if s and s.lower() != "nan"],
-                                axis=1
-                            )
-                        else:
-                            menu_df["All_Images"] = [[] for _ in range(len(menu_df))]
                     write_menu(menu_df)
                     st.success("Product updated and Excel updated.")
                     st.rerun()
@@ -582,9 +636,7 @@ with tab_admin:
                 row = {"Item": a_item, "Size": a_size, "Price": a_price}
                 imgs = [i.strip() for i in a_images.split(",") if i.strip()]
                 row["All_Images"] = imgs
-                # append to dataframe and save
-                menu_df = menu_df.append(row, ignore_index=True) if len(menu_df)>0 else pd.DataFrame([row])
-                # ensure All_Images present
+                menu_df = menu_df.append(row, ignore_index=True) if len(menu_df) > 0 else pd.DataFrame([row])
                 if "All_Images" not in menu_df.columns:
                     menu_df["All_Images"] = menu_df.apply(lambda r: r.get("All_Images", []), axis=1)
                 write_menu(menu_df)
