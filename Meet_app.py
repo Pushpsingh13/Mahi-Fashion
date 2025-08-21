@@ -1,7 +1,10 @@
+# app.py
 import os
 import io
 import json
 import smtplib
+import glob
+import urllib.parse
 from typing import Optional, List, Tuple
 from datetime import datetime
 
@@ -11,8 +14,25 @@ import pytz
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-import urllib.parse
-import glob
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from PIL import Image
+
+
+# For embedding image into PDF
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 # -------------------------
 # Configuration / files
@@ -24,15 +44,16 @@ SETTINGS_JSON = "settings.json"
 INVOICES_DIR = "invoices"
 ADMIN_PASSWORD = "admin123"
 
+# Path to your QR image (uploaded earlier). Adjust if your file path differs.
+QR_IMAGE_PATH = "Payment_QR code.jpg"
+
 os.makedirs(INVOICES_DIR, exist_ok=True)
 
 # -------------------------
 # Helpers
 # -------------------------
-
 def tz_now() -> datetime:
     return datetime.now(pytz.timezone("Asia/Kolkata"))
-
 
 def create_sample_menu() -> pd.DataFrame:
     return pd.DataFrame({
@@ -42,26 +63,21 @@ def create_sample_menu() -> pd.DataFrame:
         "Images": ["", "", ""]
     })
 
-
 def ensure_menu_exists():
     if not os.path.exists(MENU_EXCEL):
         create_sample_menu().to_excel(MENU_EXCEL, index=False, engine="openpyxl")
 
-
 def find_image_columns(df: pd.DataFrame) -> List[str]:
     return [c for c in df.columns if c.lower().startswith("image")]
-
 
 def load_menu() -> pd.DataFrame:
     ensure_menu_exists()
     try:
         df = pd.read_excel(MENU_EXCEL, engine="openpyxl")
     except Exception:
-        # fallback to sample
         df = create_sample_menu()
         df.to_excel(MENU_EXCEL, index=False, engine="openpyxl")
 
-    # Drop unnamed columns
     df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
 
     required_cols = ["Item", "Size", "Price"]
@@ -80,7 +96,6 @@ def load_menu() -> pd.DataFrame:
             axis=1
         )
     else:
-        # If individual Images columns exist use them
         possible_cols = [c for c in df.columns if c.lower().startswith("images")]
         if possible_cols:
             df["All_Images"] = df[possible_cols].apply(
@@ -91,7 +106,6 @@ def load_menu() -> pd.DataFrame:
             df["All_Images"] = [[] for _ in range(len(df))]
 
     return df
-
 
 def write_menu(df: pd.DataFrame):
     if "Item" not in df.columns:
@@ -114,11 +128,9 @@ def write_menu(df: pd.DataFrame):
     if "All_Images" in df_to_save.columns:
         df_to_save = df_to_save.drop(columns=["All_Images"])
 
-    # Drop unnamed cols before saving
     df_to_save = df_to_save.loc[:, ~df_to_save.columns.str.contains("^Unnamed")]
 
     df_to_save.to_excel(MENU_EXCEL, index=False, engine="openpyxl")
-
 
 def parse_sizes(s_raw: str) -> List[str]:
     s = (s_raw or "").strip()
@@ -134,7 +146,6 @@ def parse_sizes(s_raw: str) -> List[str]:
 # -------------------------
 # Settings persistence
 # -------------------------
-
 def load_settings() -> dict:
     defaults = {
         "owner_phone": "919999999999",
@@ -154,7 +165,6 @@ def load_settings() -> dict:
             pass
     return defaults
 
-
 def save_settings(settings: dict):
     with open(SETTINGS_JSON, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -162,65 +172,54 @@ def save_settings(settings: dict):
 settings = load_settings()
 
 # -------------------------
-# Sales & Invoices
+# Sales & Invoices (one row per order)
 # -------------------------
-
 def save_sale(order_id: str, item_rows: list, totals: dict, customer: dict):
-    rows = []
+    """
+    Save a single row per order with combined Items column, plus payment info.
+    """
     now = tz_now()
-    for r in item_rows:
-        rows.append({
-            "OrderID": order_id,
-            "Date": now.strftime("%Y-%m-%d"),
-            "Time": now.strftime("%H:%M:%S"),
-            "Item": r["item"],
-            "Size": r["size"],
-            "Price": r["price"],
-            "Customer": customer.get("name", ""),
-            "Phone": customer.get("phone", ""),
-            "Email": customer.get("email", ""),
-            "Address": customer.get("addr", ""),
-            "Subtotal": totals["subtotal"],
-            "Tax": totals["tax"],
-            "Discount": totals["discount"],
-            "GrandTotal": totals["grand"]
-        })
-    df_new = pd.DataFrame(rows)
+    items_str = "; ".join([f"{r['item']}({r.get('size','')}) ₹{r['price']:.2f}" for r in item_rows])
 
-    # save/append to sales_records.csv
-    if os.path.exists(SALES_CSV):
-        try:
-            df_old = pd.read_csv(SALES_CSV)
-            df_final = pd.concat([df_old, df_new], ignore_index=True)
-        except Exception:
+    row = {
+        "OrderID": order_id,
+        "Date": now.strftime("%Y-%m-%d"),
+        "Time": now.strftime("%H:%M:%S"),
+        "Items": items_str,
+        "Subtotal": totals["subtotal"],
+        "Tax": totals["tax"],
+        "Discount": totals["discount"],
+        "GrandTotal": totals["grand"],
+        "Customer": customer.get("name", ""),
+        "Phone": customer.get("phone", ""),
+        "Email": customer.get("email", ""),
+        "Address": customer.get("addr", ""),
+        "PaymentMethod": customer.get("payment_method", ""),
+        "PaymentRef": customer.get("payment_ref", "")
+    }
+
+    df_new = pd.DataFrame([row])
+
+    # Append to each CSV while keeping columns consistent
+    now_date = now.strftime("%Y-%m-%d")
+    target_paths = [SALES_CSV, ORDER_CSV, f"orderdetails_{now_date}.csv"]
+    for p in target_paths:
+        if os.path.exists(p):
+            try:
+                df_old = pd.read_csv(p)
+                # ensure consistent columns: add missing columns if needed
+                for col in df_new.columns:
+                    if col not in df_old.columns:
+                        df_old[col] = ""
+                for col in df_old.columns:
+                    if col not in df_new.columns:
+                        df_new[col] = ""
+                df_final = pd.concat([df_old, df_new[df_old.columns]], ignore_index=True)
+            except Exception:
+                df_final = df_new
+        else:
             df_final = df_new
-    else:
-        df_final = df_new
-    df_final.to_csv(SALES_CSV, index=False)
-
-    # save/append to orderdetails.csv (all-time)
-    if os.path.exists(ORDER_CSV):
-        try:
-            df_old = pd.read_csv(ORDER_CSV)
-            df_final_all = pd.concat([df_old, df_new], ignore_index=True)
-        except Exception:
-            df_final_all = df_new
-    else:
-        df_final_all = df_new
-    df_final_all.to_csv(ORDER_CSV, index=False)
-
-    # save/append to date-wise CSV
-    datewise_csv = f"orderdetails_{now.strftime('%Y-%m-%d')}.csv"
-    if os.path.exists(datewise_csv):
-        try:
-            df_old = pd.read_csv(datewise_csv)
-            df_final_date = pd.concat([df_old, df_new], ignore_index=True)
-        except Exception:
-            df_final_date = df_new
-    else:
-        df_final_date = df_new
-    df_final_date.to_csv(datewise_csv, index=False)
-
+        df_final.to_csv(p, index=False)
 
 def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: dict) -> Tuple[bytes, str]:
     invoice_df = pd.DataFrame(item_rows)
@@ -232,6 +231,8 @@ def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: 
         "Phone": customer.get("phone", ""),
         "Email": customer.get("email", ""),
         "Address": customer.get("addr", ""),
+        "PaymentMethod": customer.get("payment_method", ""),
+        "PaymentRef": customer.get("payment_ref", ""),
         "Subtotal": totals["subtotal"],
         "Tax": totals["tax"],
         "Discount": totals["discount"],
@@ -247,7 +248,6 @@ def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: 
     with open(path, "wb") as f:
         f.write(out.getvalue())
     return out.getvalue(), path
-
 
 def build_receipt_pdf(order_id: str, bill_rows: list, totals: dict, cust: dict) -> Optional[io.BytesIO]:
     try:
@@ -316,7 +316,6 @@ def build_receipt_pdf(order_id: str, bill_rows: list, totals: dict, cust: dict) 
     buf.seek(0)
     return buf
 
-
 def send_email_receipt(to_email: Optional[str], subject: str, body_text: str, pdf_bytes: bytes, order_id: str,
                        smtp_server: str, smtp_port: int, sender_email: str, sender_password: str) -> bool:
     if not to_email:
@@ -344,7 +343,6 @@ def send_email_receipt(to_email: Optional[str], subject: str, body_text: str, pd
         st.error(f"Failed to send email: {e}")
         return False
 
-
 def wa_me_url(phone_digits: Optional[str], message: str) -> str:
     if not phone_digits:
         return ""
@@ -354,7 +352,6 @@ def wa_me_url(phone_digits: Optional[str], message: str) -> str:
 # -------------------------
 # Streamlit UI
 # -------------------------
-
 st.set_page_config(page_title="Mahi Fashion Store", layout="wide")
 st.title("🛍️ Mahi Fashion Store")
 
@@ -420,7 +417,8 @@ with tab_cart:
             st.download_button("Download Receipt (PDF)", data=chk["pdf_buf"].getvalue(), file_name=f"Receipt_{chk['order_id']}.pdf")
         msg = f"Order {chk['order_id']}, Total ₹{chk['totals']['grand']:.2f}"
         if settings.get("owner_phone"):
-            st.markdown(f'[Send WhatsApp to Owner]({wa_me_url(settings.get("owner_phone"), "NEW ORDER: "+msg)})')
+            wa_url = wa_me_url(settings.get("owner_phone"), f"NEW ORDER: {msg}")
+            st.markdown(f'[Send WhatsApp to Owner]({wa_url})')
         if chk["customer"].get("email"):
             if st.button("Email Receipt to Customer"):
                 ok = send_email_receipt(
@@ -472,17 +470,45 @@ with tab_cart:
             cname = st.text_input("Name")
             cphone = st.text_input("Phone")
             cemail = st.text_input("Email")
-            caddr = st.text_input("Address")   # require single-line text input like other boxes
+            caddr = st.text_input("Address")   # single line as you requested
+
+            st.subheader("Payment Method")
+            payment_method = st.radio(
+                "Choose payment method",
+                ["Cash on Delivery", "UPI/PhonePe", "Credit/Debit Card", "Net Banking"]
+            )
+
+            payment_ref = ""
+            # Show QR image only for UPI/PhonePe
+            if payment_method == "UPI/PhonePe":
+                if os.path.exists(QR_IMAGE_PATH):
+                    st.image(QR_IMAGE_PATH, caption="Scan & Pay (PhonePe/UPI)", width=300)
+                    st.info("Scan the QR using PhonePe/any UPI app, complete payment, then enter the transaction/reference id below.")
+                else:
+                    st.warning("QR image not found on server (expected at {}).".format(QR_IMAGE_PATH))
+                payment_ref = st.text_input("Payment Reference / Transaction ID (enter after payment)")
+            elif payment_method in ("Credit/Debit Card", "Net Banking"):
+                payment_ref = st.text_input("Payment Reference / Transaction ID")
 
             submitted = st.form_submit_button("Checkout")
             if submitted:
-                # require all fields
+                # validations
                 if not cname.strip() or not cphone.strip() or not cemail.strip() or not caddr.strip():
                     st.error("Please fill all fields (Name, Phone, Email, Address).")
+                elif payment_method != "Cash on Delivery" and not payment_ref.strip():
+                    st.error("Please enter Payment Reference / Transaction ID for online payment.")
                 else:
                     order_id = f"ORD{tz_now().strftime('%Y%m%d%H%M%S')}"
-                    cust = {"name": cname.strip(), "phone": cphone.strip(), "email": cemail.strip(), "addr": caddr.strip()}
+                    cust = {
+                        "name": cname.strip(),
+                        "phone": cphone.strip(),
+                        "email": cemail.strip(),
+                        "addr": caddr.strip(),
+                        "payment_method": payment_method,
+                        "payment_ref": payment_ref.strip()
+                    }
                     totals = {"subtotal": subtotal, "tax": tax, "discount": discount, "grand": grand}
+                    # save order (one row)
                     save_sale(order_id, st.session_state.cart, totals, cust)
                     inv_bytes, _ = build_invoice_excel(order_id, st.session_state.cart, totals, cust)
                     pdf_buf = build_receipt_pdf(order_id, st.session_state.cart, totals, cust)
