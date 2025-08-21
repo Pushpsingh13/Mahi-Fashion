@@ -541,36 +541,3 @@ with tab_cart:
                     pdf_buf = build_receipt_pdf(order_id, st.session_state.cart, totals, cust)
                     st.session_state.last_checkout = {"order_id": order_id, "customer": cust, "totals": totals, "invoice_bytes": inv_bytes, "pdf_buf": pdf_buf}
                     st.rerun()
-import streamlit as st
-
-# ---- PAGE CONFIG ----
-st.set_page_config(
-    page_title="Customer Portal",
-    page_icon="🛍️",
-    layout="centered",
-    initial_sidebar_state="collapsed",
-)
-
-# ---- HIDE STREAMLIT MENU/FOOTER/HEADER ----
-hide_streamlit_style = """
-    <style>
-    #MainMenu {visibility: hidden;}   /* Hide hamburger menu */
-    footer {visibility: hidden;}      /* Hide footer */
-    header {visibility: hidden;}      /* Hide "Made with Streamlit" header */
-    </style>
-"""
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-
-# ---- YOUR CUSTOMER UI ----
-st.title("🛍️ Welcome to Our Customer Portal")
-st.write("This is a clean customer-facing interface with no Streamlit controls.")
-
-# Example input/output
-name = st.text_input("Enter your name")
-if name:
-    st.success(f"Hello {name}, thanks for visiting!")
-
-# Example customer action
-if st.button("Submit Order"):
-    st.balloons()
-    st.success("Your order has been submitted successfully!")
