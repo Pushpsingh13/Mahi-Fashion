@@ -180,6 +180,10 @@ def save_sale(order_id: str, item_rows: list, totals: dict, customer: dict):
     """
     now = tz_now()
     items_str = "; ".join([f"{r['item']}({r.get('size','')}) ₹{r['price']:.2f}" for r in item_rows])
+    
+    payment_status = ""
+    if customer.get("payment_method") == "UPI/PhonePe":
+        payment_status = "Payment needs to be confirmed. Once confirmed, your item will be dispatched. If not, we will contact you."
 
     row = {
         "OrderID": order_id,
@@ -195,7 +199,8 @@ def save_sale(order_id: str, item_rows: list, totals: dict, customer: dict):
         "Email": customer.get("email", ""),
         "Address": customer.get("addr", ""),
         "PaymentMethod": customer.get("payment_method", ""),
-        "PaymentRef": customer.get("payment_ref", "")
+        "PaymentRef": customer.get("payment_ref", ""),
+        "PaymentStatus": payment_status
     }
 
     df_new = pd.DataFrame([row])
@@ -223,6 +228,11 @@ def save_sale(order_id: str, item_rows: list, totals: dict, customer: dict):
 
 def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: dict) -> Tuple[bytes, str]:
     invoice_df = pd.DataFrame(item_rows)
+    
+    payment_status = ""
+    if customer.get("payment_method") == "UPI/PhonePe":
+        payment_status = "Payment needs to be confirmed. Once confirmed, your item will be dispatched. If not, we will contact you."
+
     meta = {
         "OrderID": order_id,
         "Date": tz_now().strftime("%Y-%m-%d"),
@@ -236,7 +246,8 @@ def build_invoice_excel(order_id: str, item_rows: list, totals: dict, customer: 
         "Subtotal": totals["subtotal"],
         "Tax": totals["tax"],
         "Discount": totals["discount"],
-        "GrandTotal": totals["grand"]
+        "GrandTotal": totals["grand"],
+        "PaymentStatus": payment_status
     }
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -257,7 +268,7 @@ def build_receipt_pdf(order_id: str, bill_rows: list, totals: dict, cust: dict) 
         return None
     lines = max(1, len(bill_rows))
     width = 80 * mm
-    height = (70 + 8 * lines + 40) * mm
+    height = (70 + 8 * lines + 60) * mm
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(width, height))
     y = height - 10
@@ -309,6 +320,12 @@ def build_receipt_pdf(order_id: str, bill_rows: list, totals: dict, cust: dict) 
     c.drawString(2, y, "Grand Total")
     c.drawRightString(width - 2, y, f"₹{totals['grand']:.2f}")
     y -= 14
+    if cust.get("payment_method") == "UPI/PhonePe":
+        c.setFont("Helvetica-Bold", 8)
+        c.drawCentredString(width / 2, y, "Payment needs to be confirmed.")
+        y -= 10
+        c.drawCentredString(width / 2, y, "Once confirmed, your item will be delivered.")
+        y -= 10
     c.setFont("Helvetica-Oblique", 8)
     c.drawCentredString(width / 2, y, "Thank you for shopping!")
     c.showPage()
@@ -411,14 +428,24 @@ with tab_cart:
     st.header("🛒 Your Cart")
     if st.session_state.last_checkout:
         chk = st.session_state.last_checkout
-        st.success(f"Order {chk['order_id']} placed successfully!")
+        if chk['customer'].get('payment_method') == "UPI/PhonePe":
+            st.info(f"Order {chk['order_id']} placed successfully! Your payment needs to be confirmed. Once confirmed, your item will be dispatched. If not, we will contact you.")
+        else:
+            st.success(f"Order {chk['order_id']} placed successfully!")
         st.download_button("Download Invoice (Excel)", data=chk["invoice_bytes"], file_name=f"Invoice_{chk['order_id']}.xlsx")
         if chk["pdf_buf"]:
             st.download_button("Download Receipt (PDF)", data=chk["pdf_buf"].getvalue(), file_name=f"Receipt_{chk['order_id']}.pdf")
         msg = f"Order {chk['order_id']}, Total ₹{chk['totals']['grand']:.2f}"
+        if chk['customer'].get('payment_method') == "UPI/PhonePe":
+            msg += "\n\nYour payment needs to be confirmed. Once confirmed, your item will be dispatched. If not, we will contact you."
+        
         if settings.get("owner_phone"):
-            wa_url = wa_me_url(settings.get("owner_phone"), f"NEW ORDER: {msg}")
+            from datetime import timedelta
+            dispatch_date = (tz_now() + timedelta(days=3)).strftime('%d %b %Y')
+            owner_msg = f"NEW ORDER: {chk['order_id']}. Total: ₹{chk['totals']['grand']:.2f}. Please dispatch by {dispatch_date}."
+            wa_url = wa_me_url(settings.get("owner_phone"), owner_msg)
             st.markdown(f'[Send WhatsApp to Owner]({wa_url})')
+            
         if chk["customer"].get("email"):
             if st.button("Email Receipt to Customer"):
                 ok = send_email_receipt(
@@ -527,7 +554,7 @@ with tab_admin:
         # Settings
         settings["owner_phone"] = st.text_input("Owner WhatsApp Number", settings.get("owner_phone", ""))
         settings["smtp_server"] = st.text_input("SMTP Server", settings.get("smtp_server", "smtp.gmail.com"))
-        settings["smtp_port"] = st.number_input("SMTP Port", value=int(settings.get("smtp_port", 587)))
+        settings["smtp_port"] = st.number_input("SMTP Port", value=int(settings.get("smtp_port") or 587), step=1)
         settings["sender_email"] = st.text_input("Sender Email", settings.get("sender_email", ""))
         settings["sender_password"] = st.text_input("Sender Password", settings.get("sender_password", ""), type="password")
         settings["tax_rate"] = st.number_input("Tax Rate (%)", value=float(settings.get("tax_rate", 5.0)))
@@ -662,7 +689,7 @@ with tab_admin:
                 row = {"Item": a_item, "Size": a_size, "Price": a_price}
                 imgs = [i.strip() for i in a_images.split(",") if i.strip()]
                 row["All_Images"] = imgs
-                menu_df = menu_df.append(row, ignore_index=True) if len(menu_df) > 0 else pd.DataFrame([row])
+                menu_df = pd.concat([menu_df, pd.DataFrame([row])], ignore_index=True) if len(menu_df) > 0 else pd.DataFrame([row])
                 if "All_Images" not in menu_df.columns:
                     menu_df["All_Images"] = menu_df.apply(lambda r: r.get("All_Images", []), axis=1)
                 write_menu(menu_df)
