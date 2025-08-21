@@ -388,7 +388,7 @@ except Exception as e:
 
 products = menu_df.to_dict(orient="records")
 
-tab_shop, tab_cart = st.tabs(["Shop", "Cart & Checkout"])
+tab_shop, tab_cart, tab_admin = st.tabs(["Shop", "Cart & Checkout", "Admin Panel"])
 
 # -------------------------
 # SHOP TAB
@@ -541,3 +541,157 @@ with tab_cart:
                     pdf_buf = build_receipt_pdf(order_id, st.session_state.cart, totals, cust)
                     st.session_state.last_checkout = {"order_id": order_id, "customer": cust, "totals": totals, "invoice_bytes": inv_bytes, "pdf_buf": pdf_buf}
                     st.rerun()
+
+# -------------------------
+# ADMIN TAB
+# -------------------------
+with tab_admin:
+    st.header("Admin Panel")
+    pw = st.text_input("Password", type="password")
+    if pw == ADMIN_PASSWORD:
+        st.success("Logged in")
+
+        # Settings
+        settings["owner_phone"] = st.text_input("Owner WhatsApp Number", settings.get("owner_phone", ""))
+        settings["smtp_server"] = st.text_input("SMTP Server", settings.get("smtp_server", "smtp.gmail.com"))
+        settings["smtp_port"] = st.number_input("SMTP Port", value=int(settings.get("smtp_port") or 587), step=1)
+        settings["sender_email"] = st.text_input("Sender Email", settings.get("sender_email", ""))
+        settings["sender_password"] = st.text_input("Sender Password", settings.get("sender_password", ""), type="password")
+        settings["tax_rate"] = st.number_input("Tax Rate (%)", value=float(settings.get("tax_rate", 5.0)))
+        settings["default_discount"] = st.number_input("Default Discount (%)", value=float(settings.get("default_discount", 0.0)))
+        if st.button("Save Settings"):
+            save_settings(settings)
+            st.success("Settings saved")
+
+        st.markdown("---")
+        st.subheader("📝 Manage Products")
+
+        menu_df = load_menu()
+        st.dataframe(menu_df)
+
+        # Upload new file
+        new_file = st.file_uploader("Upload updated product Excel", type=["xlsx"] )
+        if new_file:
+            with open(MENU_EXCEL, "wb") as f:
+                f.write(new_file.getbuffer())
+            st.success("Product list updated!")
+            st.rerun()
+
+        # Add new product
+        with st.expander("➕ Add Product"):
+            new_item = st.text_input("Item Name", "")
+            new_size = st.text_input("Available Sizes (comma-separated)", "")
+            new_price = st.number_input("Price", min_value=0.0, step=1.0, value=0.0)
+            new_img = st.text_input("Image URL", "")
+            if st.button("Add Product"):
+                if new_item.strip() != "":
+                    df_new = pd.DataFrame([{
+                        "Item": new_item,
+                        "Size": new_size,
+                        "Price": new_price,
+                        "Images": new_img,
+                        "Images2": "",
+                        "Images3": "",
+                        "Images4": "",
+                        "Images5": "",
+                        "Images6": "",
+                        "Images7": ""
+                    }])
+                    menu_df = pd.concat([menu_df, df_new], ignore_index=True)
+                    menu_df.to_excel(MENU_EXCEL, index=False, engine="openpyxl")
+                    st.success(f"{new_item} added successfully!")
+                    st.rerun()
+                else:
+                    st.error("Item Name cannot be empty")
+
+        st.markdown("---")
+        st.subheader("📦 Order Details CSVs")
+
+        # Download all-time orders
+        if os.path.exists(ORDER_CSV):
+            with open(ORDER_CSV, "rb") as f:
+                st.download_button("Download All Orders (orderdetails.csv)", f, file_name=ORDER_CSV)
+
+        # Download date-wise files
+        datewise_files = sorted(glob.glob("orderdetails_*.csv"))
+        if datewise_files:
+            for fpath in datewise_files:
+                fname = os.path.basename(fpath)
+                with open(fpath, "rb") as f:
+                    st.download_button(f"Download {fname}", f, file_name=fname)
+
+    else:
+        if pw:
+            st.error("Invalid password")
+
+        # Show small summary / download button for non-admin
+        st.write(f"Products in file: **{len(menu_df)}**")
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            uploaded = st.file_uploader("Upload Excel to replace product list", type=["xlsx"])
+            if uploaded:
+                with open(MENU_EXCEL, "wb") as f:
+                    f.write(uploaded.getbuffer())
+                st.success("Product Excel replaced. Reloading...")
+                st.rerun()
+            if st.button("Download current Excel"):
+                with open(MENU_EXCEL, "rb") as f:
+                    st.download_button("Download .xlsx", data=f.read(), file_name=MENU_EXCEL)
+        with col2:
+            if len(menu_df) == 0:
+                st.warning("Product list is empty (many products may have been deleted). You can restore a sample list:")
+                if st.button("Restore sample products"):
+                    create_sample_menu().to_excel(MENU_EXCEL, index=False, engine="openpyxl")
+                    st.success("Sample products restored.")
+                    st.rerun()
+
+        st.markdown("**Current product table**")
+        st.dataframe(menu_df.reset_index().rename(columns={"index":"RowIndex"}), height=250)
+
+        st.markdown("### Edit / Delete product")
+        if len(menu_df) > 0:
+            options = list(menu_df.index.astype(str))
+            sel_idx = st.selectbox("Select product row index", options)
+            sel_idx_int = int(sel_idx)
+            prod = menu_df.loc[sel_idx_int].to_dict()
+            with st.form("edit_product_form"):
+                new_item = st.text_input("Item", value=prod.get("Item", ""))
+                new_size = st.text_input("Size", value=prod.get("Size", ""))
+                new_price = st.number_input("Price", value=float(prod.get("Price", 0.0)))
+                imgs = prod.get("All_Images") or []
+                img_text = ",".join(imgs)
+                new_imgs_text = st.text_input("Images (comma separated URLs/paths)", value=img_text)
+                col_update, col_delete = st.columns(2)
+                with col_update:
+                    update_btn = st.form_submit_button("Update Product")
+                with col_delete:
+                    delete_btn = st.form_submit_button("Delete Product")
+                if update_btn:
+                    menu_df.at[sel_idx_int, "Item"] = new_item
+                    menu_df.at[sel_idx_int, "Size"] = new_size
+                    menu_df.at[sel_idx_int, "Price"] = new_price
+                    new_imgs = [i.strip() for i in new_imgs_text.split(",") if i.strip()]
+                    menu_df.at[sel_idx_int, "All_Images"] = new_imgs
+                    write_menu(menu_df)
+                    st.success("Product updated and Excel updated.")
+                    st.rerun()
+        else:
+            st.info("No rows to select for edit/delete.")
+
+        st.markdown("### Add new product")
+        with st.form("add_product_form"):
+            a_item = st.text_input("Item")
+            a_size = st.text_input("Size (comma separated or ranges)")
+            a_price = st.number_input("Price", value=0.0, min_value=0.0)
+            a_images = st.text_input("Images (comma separated URLs/paths)", value="")
+            add_btn = st.form_submit_button("Add Product")
+            if add_btn:
+                row = {"Item": a_item, "Size": a_size, "Price": a_price}
+                imgs = [i.strip() for i in a_images.split(",") if i.strip()]
+                row["All_Images"] = imgs
+                menu_df = pd.concat([menu_df, pd.DataFrame([row])], ignore_index=True) if len(menu_df) > 0 else pd.DataFrame([row])
+                if "All_Images" not in menu_df.columns:
+                    menu_df["All_Images"] = menu_df.apply(lambda r: r.get("All_Images", []), axis=1)
+                write_menu(menu_df)
+                st.success("Product added and Excel updated.")
+                st.rerun()
